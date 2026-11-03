@@ -302,7 +302,14 @@ class LoRAMemoryPool:
         linears = getattr(self, "_dense_linears", None)
         if linears is None:
             linears = {}
+            # Encoder towers can reuse the decoder's `layers.<i>.` leaf names
+            # (Gemma 4's vision MLP has `layers.<i>.mlp.gate_up.gate_up_proj`),
+            # so only probe modules the model applies LoRA to; otherwise the
+            # first match claims the key.
+            should_apply_lora = getattr(base_model, "should_apply_lora", None)
             for name, module in base_model.named_modules():
+                if should_apply_lora is not None and not should_apply_lora(name):
+                    continue
                 layer_id = get_layer_id(name)
                 base_layer = unwrap_lora_layer(module)
                 if layer_id is not None and (

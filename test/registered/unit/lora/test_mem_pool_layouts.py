@@ -318,6 +318,19 @@ class TestDenseProjectionsProbeTheBaseLinear(unittest.TestCase):
             ((1, 8, 256 // 32), (1, 512 // 32, 8)),
         )
 
+    def test_probe_skips_modules_outside_the_lora_scope(self):
+        # A VL model whose vision tower reuses the decoder's `layers.<i>.` leaf
+        # names (as Gemma 4's does) and is registered before the decoder: the
+        # probe must read the decoder linear that `should_apply_lora` admits,
+        # not whichever module first claims the `(name, layer_id)` key.
+        model = torch.nn.Module()
+        model.vision_tower = _probe_model((16, 4), ((16, 16), (4, 4)))
+        model.language_model = _probe_model((256, 32), ((256, 256), (32, 32)))
+        model.should_apply_lora = lambda name: name.startswith("language_model.")
+        self.assertEqual(
+            self._dense_shapes(self._pool(), model, 0), ((1, 8, 256), (1, 512, 8))
+        )
+
     def test_attention_projections_ignore_the_probe(self):
         model = _probe_model((256, 32), ((256, 256), (32, 32)))
         pool = self._pool()
