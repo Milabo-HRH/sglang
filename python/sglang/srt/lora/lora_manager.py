@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -43,6 +44,7 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
+    replace_submodule,
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -57,8 +59,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_available_gpu_memory, replace_submodule
-from sglang.srt.utils.hf_transformers import AutoConfig
+from sglang.srt.utils import get_available_gpu_memory
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -811,7 +812,12 @@ class LoRAManager:
 
         if target_modules and target_modules == {"all"}:
             self.target_modules = auto_detect_lora_target_modules(self.base_model)
-            self.target_modules.update(EMBEDDING_NAMES)
+            # Auto-detection only finds the parallel embedding classes LoRA can
+            # wrap, and misses a tied lm_head. Add both names when either was
+            # found; a model with its own embedding class (e.g. Gemma's scaled
+            # nn.Embedding) gets neither.
+            if self.target_modules & set(EMBEDDING_NAMES):
+                self.target_modules.update(EMBEDDING_NAMES)
             logger.info(
                 "CLI --lora-target-modules='all' resolved to %s "
                 "by inspecting the base model.",

@@ -26,9 +26,13 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora import lora_manager as lora_manager_module
+from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.lora.utils import auto_detect_lora_target_modules
+from sglang.srt.lora.utils import (
+    auto_detect_lora_target_modules,
+    get_normalized_target_modules,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -209,6 +213,7 @@ class TestAutoDetectTargets(CustomTestCase):
         attn = torch.nn.Module()
         attn.qkv_proj = _MockLinearBase()
         attn.o_proj = _MockLinearBase()
+        attn.gate_proj = _MockLinearBase()
         layer.self_attn = attn
         mlp = torch.nn.Module()
         mlp.gate_up_proj = _MockLinearBase()
@@ -232,8 +237,111 @@ class TestAutoDetectTargets(CustomTestCase):
             detected = auto_detect_lora_target_modules(model)
 
         self.assertEqual(
-            detected, {"qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"}
+            detected,
+            {
+                "qkv_proj",
+                "o_proj",
+                "self_attn.gate_proj",
+                "gate_up_proj",
+                "down_proj",
+                "lm_head",
+            },
         )
+
+
+class TestAttentionGateTargets(CustomTestCase):
+    def test_attention_gate_is_explicit_and_never_stacked_with_mlp(self):
+        """The attention gate used to become gate_up_proj, colliding with MLP LoRA."""
+        self.assertEqual(get_normalized_target_modules(["gate_proj"]), {"gate_up_proj"})
+        self.assertEqual(
+            get_normalized_target_modules(
+                ["model.layers.0.self_attn.gate_proj", "mlp.gate_proj"]
+            ),
+            {"self_attn.gate_proj", "gate_up_proj"},
+        )
+        prefix = "base_model.model.model.layers.0."
+        attn_key = prefix + "self_attn.gate_proj.lora_A.weight"
+        mlp_key = prefix + "mlp.gate_proj.lora_A.weight"
+        up_key = prefix + "mlp.up_proj.lora_A.weight"
+        attn, gate, up = [torch.full((2, 8), x) for x in (1.0, 2.0, 3.0)]
+        adapter = LoRAAdapter(
+            uid="gate",
+            config=LoRAConfig.from_dict(
+                dict(
+                    peft_type="LORA",
+                    r=2,
+                    lora_alpha=2,
+                    target_modules=["self_attn.gate_proj", "gate_proj", "up_proj"],
+                )
+            ),
+            base_hf_config=SimpleNamespace(num_hidden_layers=1),
+            load_config=None,
+            lora_backend=None,
+        )
+        adapter.initialize_weights_from_tensors(
+            {attn_key: attn, mlp_key: gate, up_key: up}
+        )
+        weights = adapter.layers[0].weights
+        self.assertEqual(
+            set(weights), {attn_key, mlp_key.replace("gate_proj", "gate_up_proj")}
+        )
+        torch.testing.assert_close(weights[attn_key], attn)
+        torch.testing.assert_close(
+            weights[mlp_key.replace("gate_proj", "gate_up_proj")], torch.cat((gate, up))
+        )
+
+
+class _MockVocabParallelEmbedding(torch.nn.Module):
+    pass
+
+
+class TestAllTargetsEmbeddings(CustomTestCase):
+    """`--lora-target-modules all` adds `embed_tokens`/`lm_head` only for the
+    embedding classes LoRA can wrap."""
+
+    @staticmethod
+    def _resolve_all(embed_tokens):
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.qkv_proj = _MockLinearBase()
+        layer.self_attn.o_proj = _MockLinearBase()
+        model.model.layers = torch.nn.ModuleList([layer])
+        model.model.embed_tokens = embed_tokens
+        model.lm_head = embed_tokens  # tied
+
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.base_model = model
+        manager.configs = {}
+        manager.lora_added_tokens_size = 0
+        with (
+            patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+                _MockParallelLMHead,
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.VocabParallelEmbedding",
+                _MockVocabParallelEmbedding,
+            ),
+        ):
+            manager.init_lora_shapes(max_lora_rank=8, target_modules={"all"})
+        return manager.target_modules
+
+    def test_tied_parallel_embedding_gets_both_targets(self):
+        targets = self._resolve_all(_MockVocabParallelEmbedding())
+        self.assertEqual(targets, {"qkv_proj", "o_proj", "embed_tokens", "lm_head"})
+
+    def test_plain_embedding_gets_no_embedding_targets(self):
+        # Gemma 3/4 tie lm_head to a scaled `nn.Embedding`, which has no
+        # `org_vocab_size`; adding `lm_head` sent init_lora_modules into the
+        # tied-head path and failed with AttributeError.
+        targets = self._resolve_all(torch.nn.Embedding(10, 8))
+        self.assertEqual(targets, {"qkv_proj", "o_proj"})
 
 
 class TestTargetValidation(CustomTestCase):
